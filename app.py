@@ -9,121 +9,249 @@ from langchain_core.documents import Document
 from dotenv import load_dotenv
 import requests
 import os
+import time
+import re
 
 load_dotenv()
 
-# ── Configurazione pagina ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Configurazione pagina
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Pokédex AI", page_icon="🔴", layout="wide")
 st.title("🔴 Pokédex AI")
 st.caption("Fai qualsiasi domanda sui Pokemon!")
 
-# ── Caricamento modelli (cached) ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Smart Retriever (Entity first → fallback semantico)
+# ─────────────────────────────────────────────────────────────
+class SmartRetriever:
+    def __init__(self, bm25_retriever, faiss_retriever, all_documents):
+        self.bm25 = bm25_retriever
+        self.faiss = faiss_retriever
+        self.all_docs = all_documents
+
+        # Indice nome → lista chunk
+        self.name_index = {}
+        for doc in all_documents:
+            pokemon = doc.metadata.get("pokemon", "").lower()
+            if pokemon:
+                if pokemon not in self.name_index:
+                    self.name_index[pokemon] = []
+                self.name_index[pokemon].append(doc)
+
+    def extract_pokemon_names(self, query: str):
+        query_lower = query.lower()
+        found = []
+
+        for name in self.name_index.keys():
+            pattern = r"\b" + re.escape(name) + r"\b"
+            if re.search(pattern, query_lower):
+                found.append(name)
+
+        return found
+
+    def _detect_aspect(self, query: str):
+        query_lower = query.lower()
+        
+        if any(k in query_lower for k in ["stat", "hp", "attacco", "difesa", "velocità"]):
+            return "statistiche"
+        elif any(k in query_lower for k in ["tipo", "type"]):
+            return "tipi"
+        elif any(k in query_lower for k in ["abilità", "ability", "abilita"]):
+            return "abilità"
+        elif any(k in query_lower for k in ["mossa", "mosse", "move"]):
+            return "mosse"
+        
+        return None
+
+    def metadata_match(self, query: str):
+        names = self.extract_pokemon_names(query)
+        matched_docs = []
+        
+        for name in names:
+            if name in self.name_index:
+                docs = self.name_index[name]
+                
+                aspect_filter = self._detect_aspect(query)
+                if aspect_filter:
+                    docs = [d for d in docs if d.metadata.get("aspect") == aspect_filter]
+                
+                matched_docs.extend(docs)
+        
+        return matched_docs
+
+    def semantic_search(self, query: str):
+        keywords_multi = {
+            "tutti", "quali", "confronta", "migliore",
+            "peggiore", "più", "meno", "lista",
+            "quanti", "elenco"
+        }
+
+        is_multi = any(k in query.lower() for k in keywords_multi)
+        k = 15 if is_multi else 5
+
+        self.bm25.k = k
+        self.faiss.search_kwargs["k"] = k
+
+        bm25_docs = self.bm25.invoke(query)
+        faiss_docs = self.faiss.invoke(query)
+
+        seen = set()
+        merged = []
+
+        for doc in bm25_docs + faiss_docs:
+            pokemon = doc.metadata.get("pokemon", "?")
+            aspect = doc.metadata.get("aspect", "?")
+            key = f"{pokemon}_{aspect}"
+            
+            if key not in seen:
+                seen.add(key)
+                merged.append(doc)
+
+        return merged
+
+    def retrieve(self, query: str):
+        matched = self.metadata_match(query)
+        if matched:
+            return matched
+        return self.semantic_search(query)
+
+
+# ─────────────────────────────────────────────────────────────
+# Caricamento retriever
+# ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_retrievers():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = FAISS.load_local("faiss_db", embeddings, allow_dangerous_deserialization=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    vectorstore = FAISS.load_local(
+        "faiss_db",
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
 
     documents = []
     for filename in os.listdir("data/"):
         if filename.endswith(".txt"):
             with open(os.path.join("data/", filename), "r", encoding="utf-8") as f:
                 content = f.read()
+
             chunks = content.split("---")
-            current_name = None
+            current_header = None
+
             for chunk in chunks:
                 chunk = chunk.strip()
                 if not chunk:
                     continue
-                if current_name is None:
-                    current_name = chunk
+
+                if current_header is None:
+                    current_header = chunk
                 else:
-                    documents.append(Document(
-                        page_content=f"--- {current_name} ---\n{chunk}",
-                        metadata={"source": filename, "pokemon": current_name}
-                    ))
-                    current_name = None
+                    # Estrai nome e aspetto
+                    match = re.match(r"^(.+?)\s*-\s*(.+)$", current_header)
+                    if match:
+                        pokemon_name = match.group(1).strip()
+                        aspect = match.group(2).strip()
+                    else:
+                        pokemon_name = current_header
+                        aspect = "generale"
+                    
+                    documents.append(
+                        Document(
+                            page_content=f"--- {current_header} ---\n{chunk}",
+                            metadata={
+                                "source": filename,
+                                "pokemon": pokemon_name,
+                                "aspect": aspect.lower()
+                            }
+                        )
+                    )
+                    current_header = None
 
     bm25 = BM25Retriever.from_documents(documents, k=5)
     faiss = vectorstore.as_retriever(search_kwargs={"k": 5})
-    return bm25, faiss
+
+    return bm25, faiss, documents
+
+
+@st.cache_resource
+def load_smart_retriever():
+    bm25, faiss, docs = load_retrievers()
+    return SmartRetriever(bm25, faiss, docs)
+
 
 @st.cache_resource
 def load_llm():
-    return ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=2048)
+    return ChatAnthropic(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        temperature=0
+    )
 
-bm25_retriever, faiss_retriever = load_retrievers()
+
+smart_retriever = load_smart_retriever()
 llm = load_llm()
 
-# ── Funzioni retrieval ─────────────────────────────────────────────────────────
-STOPWORDS = {
-    "di", "che", "tipo", "è", "qual", "quale", "mi", "parlami", "dimmi",
-    "cosa", "come", "ha", "le", "la", "lo", "il", "i", "gli", "un", "uno",
-    "una", "del", "della", "dello", "allora", "quali", "sono", "mosse",
-    "abilità", "statistiche", "stats", "vorrei", "sapere", "puoi", "dirmi",
-    "quante", "quanto", "suoi"
-}
+# ─────────────────────────────────────────────────────────────
+# Retry per Overload 529
+# ─────────────────────────────────────────────────────────────
+def safe_invoke(chain, payload, retries=5):
+    for attempt in range(retries):
+        try:
+            return chain.invoke(payload)
+        except Exception as e:
+            if "overloaded" in str(e).lower():
+                time.sleep(2 ** attempt)
+            else:
+                raise e
+    raise Exception("Anthropic overloaded dopo vari tentativi")
 
-def enhance_query(query: str) -> str:
-    tokens = query.lower().split()
-    keywords = [t for t in tokens if t not in STOPWORDS]
-    return query + " " + " ".join(keywords)
 
-def hybrid_retrieve(query: str) -> list[Document]:
-    keywords_multi = {"tutti", "quali", "confronta", "migliore", "peggiore",
-                      "più", "meno", "lista", "quanti", "elenco"}
-    is_multi = any(k in query.lower() for k in keywords_multi)
-    k = 20 if is_multi else 3
-
-    bm25_retriever.k = k
-    faiss_retriever.search_kwargs["k"] = k
-
-    bm25_docs = bm25_retriever.invoke(enhance_query(query))
-    faiss_docs = faiss_retriever.invoke(query)
-
-    seen, merged = set(), []
-    for doc in bm25_docs + faiss_docs:
-        key = doc.metadata.get("pokemon", doc.page_content[:50])
-        if key not in seen:
-            seen.add(key)
-            merged.append(doc)
-    return merged
-
-def extract_main_pokemon(query: str, docs: list[Document]) -> str:
-    query_lower = query.lower()
-    for doc in docs:
-        name = doc.metadata.get("pokemon", "").strip().lower()
-        if name and name in query_lower:
-            return name
-    if docs:
-        return docs[0].metadata.get("pokemon", "").strip()
-    return ""
-
-# ── Fetch dati da PokeAPI ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Fetch dati PokeAPI
+# ─────────────────────────────────────────────────────────────
 @st.cache_data
 def fetch_pokemon_data(name: str):
     try:
-        r = requests.get(f"https://pokeapi.co/api/v2/pokemon/{name.lower()}", timeout=5)
+        r = requests.get(
+            f"https://pokeapi.co/api/v2/pokemon/{name.lower()}",
+            timeout=5
+        )
         if r.status_code == 200:
             return r.json()
     except:
         pass
     return None
 
-# ── Prompt ─────────────────────────────────────────────────────────────────────
-prompt_template = PromptTemplate.from_template("""Sei un esperto di Pokemon. Rispondi alla domanda
-basandoti SOLO sul contesto fornito. Se non trovi la risposta nel contesto, dillo chiaramente.
+
+# ─────────────────────────────────────────────────────────────
+# Prompt
+# ─────────────────────────────────────────────────────────────
+prompt_template = PromptTemplate.from_template("""
+Sei un esperto di Pokemon.
+
+Rispondi basandoti SOLO sul contesto fornito.
+Se la domanda richiede un confronto, organizza la risposta in modo chiaro.
+Se non trovi la risposta nel contesto, dillo chiaramente.
 
 Contesto:
 {context}
 
 Domanda: {question}
 
-Risposta:""")
+Risposta:
+""")
+
 
 def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    text = "\n\n".join(doc.page_content for doc in docs)
+    return text[:8000]
 
-# ── Session state ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Session state
+# ─────────────────────────────────────────────────────────────
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "last_docs" not in st.session_state:
@@ -131,7 +259,10 @@ if "last_docs" not in st.session_state:
 if "last_question" not in st.session_state:
     st.session_state.last_question = ""
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Layout
+# ─────────────────────────────────────────────────────────────
 col_chat, col_sidebar = st.columns([2, 1])
 
 with col_chat:
@@ -142,31 +273,47 @@ with col_chat:
     if question := st.chat_input("Chiedi qualcosa sui Pokemon..."):
         with st.chat_message("user"):
             st.markdown(question)
-        st.session_state.chat_history.append({"role": "user", "content": question})
 
-        docs = hybrid_retrieve(question)
+        st.session_state.chat_history.append({
+            "role": "user",
+            "content": question
+        })
+
+        docs = smart_retriever.retrieve(question)
         context = format_docs(docs)
 
         with st.chat_message("assistant"):
             with st.spinner("Sto cercando..."):
                 chain = prompt_template | llm | StrOutputParser()
-                response = chain.invoke({"context": context, "question": question})
+                response = safe_invoke(
+                    chain,
+                    {"context": context, "question": question}
+                )
             st.markdown(response)
 
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": response
+        })
+
         st.session_state.last_docs = docs
         st.session_state.last_question = question
         st.rerun()
 
+
+# ─────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────
 with col_sidebar:
     docs = st.session_state.last_docs
     question = st.session_state.last_question
 
     if not docs:
-        st.info("👈 Fai una domanda per vedere le informazioni sul Pokemon!")
+        st.info("👈 Fai una domanda per vedere le info!")
     else:
-        # Immagine e stats del Pokemon principale
-        main_name = extract_main_pokemon(question, docs)
+        main_doc = docs[0]
+        main_name = main_doc.metadata.get("pokemon", "")
+
         if main_name:
             data = fetch_pokemon_data(main_name)
             if data:
@@ -176,34 +323,20 @@ with col_sidebar:
                 if img_url:
                     st.image(img_url, width=200)
 
-                types = [t["type"]["name"].capitalize() for t in data["types"]]
-                type_colors = {
-                    "Fire": "🔴", "Water": "🔵", "Grass": "🟢", "Electric": "🟡",
-                    "Psychic": "🟣", "Ice": "🩵", "Dragon": "🟠", "Dark": "⚫",
-                    "Fairy": "🩷", "Normal": "⚪", "Fighting": "🟤", "Flying": "🌀",
-                    "Poison": "💜", "Ground": "🟫", "Rock": "🪨", "Bug": "🐛",
-                    "Ghost": "👻", "Steel": "⚙️"
-                }
-                st.write(" ".join([f"{type_colors.get(t, '❓')} {t}" for t in types]))
-
                 st.subheader("Statistiche")
-                stat_names = {
-                    "hp": "HP", "attack": "Attacco", "defense": "Difesa",
-                    "special-attack": "Att. Sp.", "special-defense": "Dif. Sp.", "speed": "Velocità"
-                }
                 for stat in data["stats"]:
-                    name = stat_names.get(stat["stat"]["name"], stat["stat"]["name"])
-                    value = stat["base_stat"]
-                    st.write(f"**{name}**: {value}")
-                    st.progress(min(value / 255, 1.0))
+                    st.write(f"{stat['stat']['name']}: {stat['base_stat']}")
+                    st.progress(min(stat["base_stat"] / 255, 1.0))
 
-        # Fonti recuperate
         st.subheader("📄 Fonti recuperate")
         for doc in docs:
             pokemon = doc.metadata.get("pokemon", "?")
+            aspect = doc.metadata.get("aspect", "?")
             source = doc.metadata.get("source", "?")
-            with st.expander(f"🔹 {pokemon} ({source})"):
+            
+            with st.expander(f"🔹 {pokemon} - {aspect.capitalize()} ({source})"):
                 st.text(doc.page_content[:300] + "...")
+
 
     if st.session_state.chat_history:
         st.divider()

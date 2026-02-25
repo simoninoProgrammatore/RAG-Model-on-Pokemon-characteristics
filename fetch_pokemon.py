@@ -22,26 +22,55 @@ def fetch_pokemon(name_or_id):
     return None
 
 def pokemon_to_text(data):
+    """
+    Genera chunk GRANULARI per aspetto (stats, types, abilities, moves).
+    Ogni chunk mantiene il nome del Pokemon per entity matching.
+    """
     name = data["name"].capitalize()
-    types = ", ".join([t["type"]["name"] for t in data["types"]])
+    chunks = []
+    
+    # ─────────────────────────────────────────────
+    # 1️⃣ CHUNK: Statistiche
+    # ─────────────────────────────────────────────
     stats = {s["stat"]["name"]: s["base_stat"] for s in data["stats"]}
-    abilities = ", ".join([a["ability"]["name"] for a in data["abilities"]])
-    moves = ", ".join([m["move"]["name"] for m in data["moves"]][:20])
-
-    text = f"""--- {name} ---
+    chunks.append(f"""--- {name} - Statistiche ---
 Nome: {name}
-Tipi: {types}
-Abilita: {abilities}
-Mosse: {moves}
 HP: {stats.get("hp", "?")}
 Attacco: {stats.get("attack", "?")}
 Difesa: {stats.get("defense", "?")}
 Attacco Speciale: {stats.get("special-attack", "?")}
 Difesa Speciale: {stats.get("special-defense", "?")}
-Velocita: {stats.get("speed", "?")}
-
-"""
-    return text
+Velocità: {stats.get("speed", "?")}
+""")
+    
+    # ─────────────────────────────────────────────
+    # 2️⃣ CHUNK: Tipi
+    # ─────────────────────────────────────────────
+    types = ", ".join([t["type"]["name"] for t in data["types"]])
+    chunks.append(f"""--- {name} - Tipi ---
+Nome: {name}
+Tipi: {types}
+""")
+    
+    # ─────────────────────────────────────────────
+    # 3️⃣ CHUNK: Abilità
+    # ─────────────────────────────────────────────
+    abilities = ", ".join([a["ability"]["name"] for a in data["abilities"]])
+    chunks.append(f"""--- {name} - Abilità ---
+Nome: {name}
+Abilità: {abilities}
+""")
+    
+    # ─────────────────────────────────────────────
+    # 4️⃣ CHUNK: Mosse (top 20)
+    # ─────────────────────────────────────────────
+    moves = ", ".join([m["move"]["name"] for m in data["moves"]][:20])
+    chunks.append(f"""--- {name} - Mosse ---
+Nome: {name}
+Mosse principali: {moves}
+""")
+    
+    return "\n\n".join(chunks) + "\n\n"
 
 def fetch_all_pokemon():
     os.makedirs("data", exist_ok=True)
